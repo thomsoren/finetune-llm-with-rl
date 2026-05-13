@@ -1,0 +1,36 @@
+# Data & model artifacts (multi-GB, hosted elsewhere)
+rl-finetuning/data/
+rl-finetuning/models/
+rl-finetuning/checkpoints/
+rl-finetuning/logs/
+
+# Local venvs and caches
+rl-venv/
+.venv/
+venv/
+.venv-backups/
+.hf_home/
+
+# Full upstream verl tree (only verl_patches/ is tracked; clone verl separately)
+verl/
+
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+
+# Secrets — never commit
+.env
+*.key
+*_token*
+
+# Local Claude state
+.claude/
+CLAUDE.md
+claude_gpu_prompt.md
