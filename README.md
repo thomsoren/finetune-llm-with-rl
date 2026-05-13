@@ -1,5 +1,17 @@
 # finetune-llm-rl
 
+Inspiration from: 
+https://github.com/AIFrameResearch/SPO - arxiv.org/abs/2505.23564
+Deepseek V4 - uses GPRO for RL-Finetuning
+
+SOAP has only been seen used in pre-training as a better alternative of AdamW.
+
+SOAP is meant to handle noisy environments by using double derivative of loss instead of only single derivative to get gradient. 
+
+Thats why I find it intuitive to research how SOAP will perform on CoT reasoning RL finetuning using state of the art RL finetunings methods like GRPO and SPO. 
+
+The aim of this is to prove that SOAP + SPO is a good method to create state of the art large language models. 
+
 3-row RL fine-tuning experiment on Qwen2.5-Math-1.5B comparing GRPO / SPO / SPO+SOAP for math reasoning.
 
 | Row | Algorithm | Optimizer | Claim |
