@@ -11,6 +11,10 @@ venv/
 .venv-backups/
 .hf_home/
 
+# Hydra working dirs
+outputs/
+multirun/
+
 # Full upstream verl tree (only verl_patches/ is tracked; clone verl separately)
 verl/
 

@@ -7,6 +7,7 @@ export PYTHONUNBUFFERED=1
 : "${WANDB_API_KEY:?WANDB_API_KEY must be set (see CLAUDE.md)}"
 : "${HF_TOKEN:?HF_TOKEN must be set}"
 export WANDB_PROJECT="${WANDB_PROJECT:-rl-finetuning-thesis}"
+export PYTHONPATH="/workspace:${PYTHONPATH:-}"
 
 mkdir -p /workspace/rl-finetuning/logs /workspace/rl-finetuning/checkpoints/row1
 
@@ -16,7 +17,7 @@ MODEL=/workspace/rl-finetuning/models/Qwen2.5-Math-1.5B
 TRAIN=/workspace/rl-finetuning/data/gsm8k/train.parquet
 VAL=/workspace/rl-finetuning/data/gsm8k/test.parquet
 
-/venv/main/bin/python -m verl.trainer.main_ppo \
+/venv/main/bin/python -m rl_finetuning.train \
     algorithm.adv_estimator=grpo \
     algorithm.use_kl_in_reward=False \
     algorithm.kl_ctrl.type=fixed \

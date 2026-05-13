@@ -6,6 +6,7 @@ export PYTHONUNBUFFERED=1
 : "${WANDB_API_KEY:?WANDB_API_KEY must be set}"
 : "${HF_TOKEN:?HF_TOKEN must be set}"
 export WANDB_PROJECT="${WANDB_PROJECT:-rl-finetuning-thesis}"
+export PYTHONPATH="/workspace:${PYTHONPATH:-}"
 
 mkdir -p /workspace/rl-finetuning/logs /workspace/rl-finetuning/checkpoints/row3
 
@@ -15,7 +16,7 @@ MODEL=/workspace/rl-finetuning/models/Qwen2.5-Math-1.5B
 TRAIN=/workspace/rl-finetuning/data/gsm8k/train.parquet
 VAL=/workspace/rl-finetuning/data/gsm8k/test.parquet
 
-/venv/main/bin/python -m verl.trainer.main_ppo \
+/venv/main/bin/python -m rl_finetuning.train \
     algorithm.adv_estimator=spo \
     algorithm.use_kl_in_reward=False \
     algorithm.kl_ctrl.type=fixed \
@@ -32,7 +33,7 @@ VAL=/workspace/rl-finetuning/data/gsm8k/test.parquet
     actor_rollout_ref.model.use_remove_padding=True \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
     actor_rollout_ref.actor.optim.optimizer=SOAP \
-    actor_rollout_ref.actor.optim.optimizer_impl=verl.utils.optim.soap \
+    actor_rollout_ref.actor.optim.optimizer_impl=rl_finetuning.soap \
     actor_rollout_ref.actor.optim.lr=5e-7 \
     actor_rollout_ref.actor.optim.weight_decay=0.01 \
     actor_rollout_ref.actor.optim.betas='[0.95,0.95]' \
