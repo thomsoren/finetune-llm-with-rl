@@ -15,6 +15,9 @@ venv/
 outputs/
 multirun/
 
+# wandb local
+wandb/
+
 # Full upstream verl tree (only verl_patches/ is tracked; clone verl separately)
 verl/
 
