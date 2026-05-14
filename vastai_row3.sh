@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 # Row 3: SPO + SOAP (the thesis)
+# Phase 1: single config, 200 steps, confirm SOAP trains stably.
+# LR sweep is Phase 2 — see notes in repo.
 set -uo pipefail
 export PYTHONUNBUFFERED=1
 
@@ -7,6 +9,7 @@ export PYTHONUNBUFFERED=1
 : "${HF_TOKEN:?HF_TOKEN must be set}"
 export WANDB_PROJECT="${WANDB_PROJECT:-rl-finetuning-thesis}"
 export PYTHONPATH="/workspace:${PYTHONPATH:-}"
+export VERL_ADV_EST_USER_PKG="${VERL_ADV_EST_USER_PKG:-rl_finetuning}"
 
 mkdir -p /workspace/rl-finetuning/logs /workspace/rl-finetuning/checkpoints/row3
 
@@ -34,15 +37,17 @@ VAL=/workspace/rl-finetuning/data/gsm8k/test.parquet
     actor_rollout_ref.model.path="$MODEL" \
     actor_rollout_ref.model.use_remove_padding=True \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
-    actor_rollout_ref.actor.optim.optimizer=SOAP \
+    actor_rollout_ref.actor.optim.optimizer=HybridSOAPAdamW \
     actor_rollout_ref.actor.optim.optimizer_impl=rl_finetuning.soap \
-    actor_rollout_ref.actor.optim.lr=5e-7 \
+    actor_rollout_ref.actor.optim.lr=5e-5 \
     actor_rollout_ref.actor.optim.weight_decay=0.01 \
     actor_rollout_ref.actor.optim.betas='[0.95,0.95]' \
-    actor_rollout_ref.actor.optim.override_optimizer_config='{precondition_frequency:20,max_precond_dim:10000,merge_dims:true}' \
+    actor_rollout_ref.actor.optim.lr_warmup_steps=150 \
+    actor_rollout_ref.actor.optim.lr_scheduler_type=constant \
+    actor_rollout_ref.actor.optim.override_optimizer_config='{precondition_frequency:100,max_precond_dim:2048,shampoo_beta:-1,correct_bias:true}' \
     actor_rollout_ref.actor.ppo_mini_batch_size=16 \
     actor_rollout_ref.actor.use_kl_loss=True \
-    actor_rollout_ref.actor.kl_loss_coef=0.0001 \
+    actor_rollout_ref.actor.kl_loss_coef=0.00005 \
     actor_rollout_ref.actor.kl_loss_type=low_var_kl \
     actor_rollout_ref.actor.entropy_coeff=0.001 \
     actor_rollout_ref.actor.clip_ratio=0.2 \
@@ -67,9 +72,9 @@ VAL=/workspace/rl-finetuning/data/gsm8k/test.parquet
     trainer.n_gpus_per_node=4 \
     trainer.nnodes=1 \
     trainer.save_freq=-1 \
-    trainer.test_freq=25 \
+    trainer.test_freq=50 \
     trainer.total_epochs=1 \
-    trainer.total_training_steps=50 \
+    trainer.total_training_steps=200 \
     trainer.default_local_dir=/workspace/rl-finetuning/checkpoints/row3 \
     2>&1 | tee /workspace/rl-finetuning/logs/row3.log
 

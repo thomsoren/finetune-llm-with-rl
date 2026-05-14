@@ -4,6 +4,73 @@ import torch.optim as optim
 
 from itertools import chain
 
+
+_EMBED_DIM_THRESHOLD = 100_000
+
+
+class HybridSOAPAdamW(optim.Optimizer):
+    """SOAP for 2D non-embedding params, AdamW for everything else.
+
+    verl's build_optimizer hands us raw param iterators with no names, so we
+    classify by shape: 1D params (norms, biases) and 2D params whose larger
+    dim exceeds _EMBED_DIM_THRESHOLD (Qwen vocab ~152k) go to AdamW; the rest
+    go to SOAP.
+    """
+
+    def __init__(
+        self,
+        params,
+        lr: float = 5e-5,
+        betas=(0.95, 0.95),
+        weight_decay: float = 0.01,
+        eps: float = 1e-8,
+        precondition_frequency: int = 100,
+        max_precond_dim: int = 2048,
+        shampoo_beta: float = -1,
+        correct_bias: bool = True,
+        adamw_betas=(0.9, 0.95),
+    ):
+        all_params = list(params)
+        adamw, soap_p = [], []
+        for p in all_params:
+            if p.ndim != 2 or max(p.shape) > _EMBED_DIM_THRESHOLD:
+                adamw.append(p)
+            else:
+                soap_p.append(p)
+
+        self._adamw = optim.AdamW(adamw, lr=lr, betas=adamw_betas, weight_decay=weight_decay, eps=eps)
+        self._soap = SOAP(
+            soap_p,
+            lr=lr,
+            betas=betas,
+            weight_decay=weight_decay,
+            eps=eps,
+            precondition_frequency=precondition_frequency,
+            max_precond_dim=max_precond_dim,
+            shampoo_beta=shampoo_beta,
+            correct_bias=correct_bias,
+        )
+
+        super().__init__(
+            [{"params": adamw, "kind": "adamw"}, {"params": soap_p, "kind": "soap"}],
+            {"lr": lr, "weight_decay": weight_decay},
+        )
+
+        n_a = sum(p.numel() for p in adamw)
+        n_s = sum(p.numel() for p in soap_p)
+        print(f"[HybridSOAPAdamW] AdamW params: {len(adamw)} ({n_a/1e6:.1f}M), SOAP params: {len(soap_p)} ({n_s/1e6:.1f}M)")
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = closure() if closure is not None else None
+        self._adamw.step()
+        self._soap.step()
+        return loss
+
+    def zero_grad(self, set_to_none: bool = True):
+        self._adamw.zero_grad(set_to_none=set_to_none)
+        self._soap.zero_grad(set_to_none=set_to_none)
+
 # Parts of the code are modifications of Pytorch's AdamW optimizer
 # Parts of the code are modifications of code from https://github.com/jiaweizzhao/GaLore/blob/master/galore_torch/galore_projector.py
 
