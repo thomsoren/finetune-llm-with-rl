@@ -51,41 +51,78 @@ vastai_row3.sh          # Row 3: SPO  + HybridSOAPAdamW  (200 steps, GSM8K) — 
 
 `vastai_setup.sh` and `vastai_clean_setup.sh` are kept for reference but the **current setup path uses verl's own install script** directly (see below).
 
-## Running (current, validated)
+## Zero-to-Phase-1, copy-paste
 
-1. Provision a 4×GPU box. Validated on 4× RTX 3090 24 GB, CUDA 12.8, torch 2.8.0+cu128.
-2. Use the system venv (`source /venv/main/bin/activate` on vast.ai images). Don't `uv venv` a fresh one — that's how we lost an afternoon last time.
-3. Clone verl and let its own install script handle vllm / sglang / flash-attn:
-   ```bash
-   git clone --depth 1 https://github.com/volcengine/verl.git /workspace/verl
-   cd /workspace/verl
-   USE_MEGATRON=0 USE_SGLANG=1 bash scripts/install_vllm_sglang_mcore.sh
-   uv pip install --no-deps -e .
-   ```
-   verl's script downgrades torch to 2.8 (vllm 0.11 / sglang 0.5.2 pin it) and installs flash-attn 2.8.1. **It also bumps numpy to 2.4.x via opencv-fixer; we have to pull it back:**
-   ```bash
-   uv pip install 'numpy>=2.0,<2.3'
-   ```
-   otherwise vllm crashes at engine init with `Numba needs NumPy 2.2 or less`.
-4. Apply the verl patch (one liner, idempotent):
-   ```bash
-   python apply_spo_patch.py
-   ```
-5. Symlink the package so verl's PYTHONPATH=/workspace finds it:
-   ```bash
-   ln -sfn $(pwd)/rl_finetuning /workspace/rl_finetuning
-   ```
-6. Download model + data:
-   ```bash
-   huggingface-cli download Qwen/Qwen2.5-Math-1.5B --local-dir /workspace/rl-finetuning/models/Qwen2.5-Math-1.5B
-   python /workspace/verl/examples/data_preprocess/gsm8k.py --local_save_dir /workspace/rl-finetuning/data/gsm8k
-   ```
-7. Set env and launch:
-   ```bash
-   export HF_TOKEN=... WANDB_API_KEY=...
-   export NCCL_P2P_DISABLE=1 NCCL_SHM_DISABLE=1 NCCL_IB_DISABLE=1   # required on consumer GPUs — see below
-   bash vastai_row1.sh   # then row2, row3
-   ```
+Validated end-to-end on a fresh vast.ai 4× RTX 3090 24 GB box, CUDA 12.8, with vast.ai's default Python 3.12 image. The whole sequence below brings a blank box from boot to "row 3 ready to launch" in ~25 min, of which ~15 is the `install_vllm_sglang_mcore.sh` step.
+
+Tested with: torch 2.8.0+cu128, vllm 0.11.0, sglang 0.5.2, flash-attn 2.8.1, flashinfer 0.3.1, transformers 4.56.1, verl 0.8.0.dev0.
+
+```bash
+# 0. Tokens — paste yours here.
+export HF_TOKEN=...
+export WANDB_API_KEY=...
+
+# 1. Use the image's existing venv. Do NOT `uv venv` a fresh one.
+source /venv/main/bin/activate
+
+# 2. Clone this repo + verl side by side.
+cd /workspace
+git clone https://github.com/thomsoren/finetune-llm-with-rl.git
+git clone --depth 1 https://github.com/volcengine/verl.git
+
+# 3. verl's own installer — pulls vllm 0.11 / sglang 0.5.2 / flash-attn 2.8.1.
+#    It pins torch to 2.8.0 (downgrades from the image's 2.11), which matches
+#    the flash-attn wheel. Skip Megatron — FSDP is enough for 1.5B / 4×3090.
+cd /workspace/verl
+USE_MEGATRON=0 USE_SGLANG=1 bash scripts/install_vllm_sglang_mcore.sh
+uv pip install --no-deps -e .
+
+# 4. The installer's opencv-fixer step bumps numpy to 2.4.x, but vllm imports
+#    numba on startup and numba caps at numpy <= 2.2. Pull it back:
+uv pip install 'numpy>=2.0,<2.3'
+
+# 5. Apply the verl patch (idempotent). See "Why we patch verl" below.
+cd /workspace/finetune-llm-with-rl
+python apply_spo_patch.py
+
+# 6. Symlink the package so verl's PYTHONPATH=/workspace finds it.
+ln -sfn /workspace/finetune-llm-with-rl/rl_finetuning /workspace/rl_finetuning
+
+# 7. Model + data.
+mkdir -p /workspace/rl-finetuning/{models,data/gsm8k,logs,checkpoints/{row1,row2,row3}}
+huggingface-cli download Qwen/Qwen2.5-Math-1.5B \
+    --local-dir /workspace/rl-finetuning/models/Qwen2.5-Math-1.5B
+python /workspace/verl/examples/data_preprocess/gsm8k.py \
+    --local_save_dir /workspace/rl-finetuning/data/gsm8k
+
+# 8. NCCL env required on consumer GPUs (RTX 3090, no NVLink). Without these
+#    you get `Cuda failure 217 'peer access is not supported between these
+#    two devices'` and the run dies before step 1. Skip on NVLink hardware.
+export NCCL_P2P_DISABLE=1 NCCL_SHM_DISABLE=1 NCCL_IB_DISABLE=1
+
+# 9. SPO discovery hook for Ray actors — see "Why we patch verl".
+export VERL_ADV_EST_USER_PKG=rl_finetuning
+
+# 10. Quick sanity check before burning a long run.
+python -c "
+from verl.trainer.ppo.core_algos import get_adv_estimator_fn
+import os; os.environ.setdefault('VERL_ADV_EST_USER_PKG','rl_finetuning')
+import sys; sys.path.insert(0,'/workspace')
+print('SPO:', get_adv_estimator_fn('spo').__name__)
+from rl_finetuning.soap import HybridSOAPAdamW; print('HybridSOAPAdamW:', HybridSOAPAdamW.__name__)
+import torch; print('torch:', torch.__version__, 'cuda:', torch.cuda.device_count(), 'GPUs')
+"
+# Expected: SPO: compute_spo_outcome_advantage / HybridSOAPAdamW: HybridSOAPAdamW
+#           torch: 2.8.0+cu128 cuda: 4 GPUs
+
+# 11. Launch.
+cd /workspace/finetune-llm-with-rl
+bash vastai_row1.sh   # GRPO + AdamW, 50 steps  (~50 min)
+bash vastai_row2.sh   # SPO  + AdamW, 50 steps  (~50 min)
+bash vastai_row3.sh   # SPO  + HybridSOAPAdamW, 200 steps  (~3.5 h)
+```
+
+Between runs, `ray stop --force && pkill -9 -f ray:: 2>/dev/null` if you see leftover processes (the row scripts call `ray stop --force` themselves but it occasionally misses one).
 
 ## Why we patch verl
 
@@ -146,6 +183,8 @@ Tuned for 4× 24 GB GPUs:
 
 KL coefficient is tightened ~2× vs the AdamW baselines (`kl_loss_coef=5e-5` vs `1e-4`) because SOAP makes the policy move faster.
 
+**Required FSDP flag** (already set in `vastai_row3.sh`): `actor_rollout_ref.actor.fsdp_config.use_orig_params=True`. Without this, FSDP1 wraps every parameter into a 1D `FlatParameter` and the shape-based splitter routes everything into AdamW — SOAP gets an empty parameter list and crashes at engine init with `optimizer got an empty parameter list`. Rows 1 and 2 don't need this flag because plain AdamW doesn't care about parameter shapes.
+
 ## Results so far
 
 50-step smoke runs on Qwen2.5-Math-1.5B / GSM8K, 4× RTX 3090:
@@ -157,19 +196,6 @@ KL coefficient is tightened ~2× vs the AdamW baselines (`kl_loss_coef=5e-5` vs 
 | 3 SPO  + Hybrid SOAP+AdamW | _Phase 1 pending_ | | | | |
 
 Both step-50 val numbers are close (~0.69). The shape difference (GRPO peaks early, SPO catches up) is suggestive but 50 steps is too short to draw conclusions — that's why row 3 is Phase 1 at **200 steps**.
-
-## Caveats
-
-`compute_spo_outcome_advantage` in `rl_finetuning/spo.py` does **GRPO-style scalar reward redistribution across segments**, not the per-segment Monte Carlo value estimation from the SPO paper ([arxiv 2505.23564](https://arxiv.org/abs/2505.23564)). For a faithful SPO comparison, the rollout pipeline would need to do `N=9` MC rollouts from each segment-boundary state and use `Â_k = V̂(s_{t_k+1}) − V̂(s_{t_k})`.
-
-## Configuration notes
-
-Tuned for 4× 24 GB GPUs:
-- `gpu_memory_utilization=0.55`, `tensor_model_parallel_size=1`, `rollout.n=8`
-- `data.train_batch_size=32`, `ppo_mini_batch_size=16`
-- Dynamic batching (`use_dynamic_bsz=True`, `ppo_max_token_len_per_gpu=3072`)
-- Ref model offloaded to CPU during rollout
-- `save_freq=-1` (no checkpoints — disk on vast.ai instances is tight)
 
 ## Caveats
 

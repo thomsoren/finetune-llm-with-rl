@@ -55,6 +55,7 @@ VAL=/workspace/rl-finetuning/data/gsm8k/test.parquet
     actor_rollout_ref.actor.ppo_max_token_len_per_gpu=3072 \
     actor_rollout_ref.actor.fsdp_config.param_offload=False \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
+    actor_rollout_ref.actor.fsdp_config.use_orig_params=True \
     actor_rollout_ref.rollout.name=vllm \
     actor_rollout_ref.rollout.temperature=1.0 \
     actor_rollout_ref.rollout.top_p=1.0 \
