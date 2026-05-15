@@ -32,11 +32,15 @@ class HybridSOAPAdamW(optim.Optimizer):
     ):
         all_params = list(params)
         adamw, soap_p = [], []
+        _shape_counts = {}
         for p in all_params:
+            key = (p.ndim, tuple(p.shape))
+            _shape_counts[key] = _shape_counts.get(key, 0) + 1
             if p.ndim != 2 or max(p.shape) > _EMBED_DIM_THRESHOLD:
                 adamw.append(p)
             else:
                 soap_p.append(p)
+        print(f"[HybridSOAPAdamW] param shape histogram: {sorted(_shape_counts.items())[:20]} (total={len(all_params)})")
 
         self._adamw = optim.AdamW(adamw, lr=lr, betas=adamw_betas, weight_decay=weight_decay, eps=eps)
         self._soap = SOAP(
@@ -189,7 +193,10 @@ class SOAP(optim.Optimizer):
             for p in group["params"]:
                 if p.grad is None:
                     continue
-                grad = p.grad
+                # FSDP2 hands params/grads as DTensor; SOAP's preconditioner math
+                # mixes them with plain tensors. Run SOAP on each rank's local shard.
+                p_local = p.to_local() if hasattr(p, "to_local") else p
+                grad = p.grad.to_local() if hasattr(p.grad, "to_local") else p.grad
 
                 state = self.state[p]
                 
@@ -256,8 +263,8 @@ class SOAP(optim.Optimizer):
                 if group["normalize_grads"]:
                     norm_grad = norm_grad / (1e-30+torch.mean(norm_grad**2)**0.5)
                 
-                p.add_(norm_grad, alpha=-step_size)
-                
+                p_local.add_(norm_grad, alpha=-step_size)
+
 
                 # From AdamW code: Just adding the square of the weights to the loss function is *not*
                 # the correct way of using L2 regularization/weight decay with Adam,
@@ -268,7 +275,7 @@ class SOAP(optim.Optimizer):
                 # of the weights to the loss with plain (non-momentum) SGD.
                 # Add weight decay at the end (fixed version)
                 if group["weight_decay"] > 0.0:
-                    p.add_(p, alpha=(-group["lr"] * group["weight_decay"]))
+                    p_local.add_(p_local, alpha=(-group["lr"] * group["weight_decay"]))
                     
                 # Update is done after the gradient step to avoid using current gradients in the projection.
                 self.update_preconditioner(grad, state, 
@@ -314,25 +321,27 @@ class SOAP(optim.Optimizer):
                 permuted_shape = grad.permute(0, 3, 1, 2).shape
             grad = self.merge_dims(grad, max_precond_dim)
 
+        orig_dtype = grad.dtype
         for mat in state['Q']:
             if len(mat) > 0:
                 grad = torch.tensordot(
-                        grad,
-                        mat,
+                        grad.float(),
+                        mat.float(),
                         dims=[[0], [0]],
                     )
             else:
                 permute_order = list(range(1, len(grad.shape))) + [0]
                 grad = grad.permute(permute_order)
-        
+        grad = grad.to(orig_dtype)
+
         if merge_dims:
             if self._data_format == 'channels_last' and len(original_shape) == 4:
                 grad = grad.reshape(permuted_shape).permute(0, 2, 3, 1)
             else:
                 grad = grad.reshape(original_shape)
         return grad
-        
-    def update_preconditioner(self, grad, state, 
+
+    def update_preconditioner(self, grad, state,
                               max_precond_dim=10000, merge_dims=False, precondition_1d=False):
         """
         Updates the preconditioner matrices and the eigenbases (L, R, Q_L, Q_R in the paper).
@@ -382,17 +391,19 @@ class SOAP(optim.Optimizer):
             if self._data_format == 'channels_last' and grad.dim() == 4:
                 permuted_shape = grad.permute(0, 3, 1, 2).shape
             grad = self.merge_dims(grad, max_precond_dim)
+        orig_dtype = grad.dtype
         for mat in state['Q']:
             if len(mat) > 0:
                 grad = torch.tensordot(
-                        grad,
-                        mat,
+                        grad.float(),
+                        mat.float(),
                         dims=[[0], [1]],
                     )
             else:
                 permute_order = list(range(1, len(grad.shape))) + [0]
                 grad = grad.permute(permute_order)
-                
+        grad = grad.to(orig_dtype)
+
         if merge_dims:
             if self._data_format == 'channels_last' and len(original_shape) == 4:
                 grad = grad.reshape(permuted_shape).permute(0, 2, 3, 1)
