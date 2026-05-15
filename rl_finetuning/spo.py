@@ -5,23 +5,20 @@ Registered with verl's adv-estimator registry at import time so that
 
 Two execution paths:
 
-1. **Paper-faithful SPO-chain** (default when MC values are available):
-   The trainer's `compute_advantage` wrapper (installed in `spo_trainer.py`)
-   calls `spo_mc.compute_and_store_mc_values` first, which writes
-   `spo_segment_values [B, T+2]` and `spo_segment_cutpoints [B, T+2]` onto the
-   batch. This estimator reads them and emits segment advantages
-   A_t = V(s_{cp_t}) - V(s_{cp_{t-1}}) broadcast over the tokens of segment t.
-   The first slot is V(s_0) = group baseline; the last is the actual outcome
-   reward, so the telescoping sum recovers the per-response advantage and
-   intermediate V values give per-segment credit.
+1. **Paper-faithful SPO-chain** (MC values present on the batch):
+   `spo_mc.compute_and_store_mc_values` writes `spo_segment_values [B, T+2]`
+   and `spo_segment_cutpoints [B, T+2]` before this estimator runs. We:
+     - Center per row by V(s_0) so V_centered(s_0)=0 and V_centered(s_T)=R-V(s_0).
+     - Group-normalize by the group's std of R so the per-response advantage
+       sum has GRPO-comparable variance.
+     - Compute segment advantages A_t = V_centered_norm(s_{cp_t}) - V_centered_norm(s_{cp_{t-1}})
+       and broadcast over the tokens of segment t.
+     - Optionally zero tokens where the old policy was already very confident
+       (paper Eq. 3: p_old > threshold). Wired via the trainer monkey-patch
+       passing `old_log_probs`.
 
-   Probability masking (paper Eq. 3): tokens whose old policy probability
-   exceeds `prob_mask_threshold` get zeroed advantage. This requires the
-   trainer wrapper to pass `old_log_probs` through as a kwarg.
-
-2. **GRPO-style fallback** (if the MC fields are absent on the batch — e.g.
-   the trainer wrapper was not installed): group-normalize outcome rewards
-   and broadcast uniformly over tokens. Equivalent to GRPO.
+2. **GRPO-style fallback** (MC values absent): group-normalize outcome rewards
+   and broadcast uniformly over tokens — equivalent to vanilla GRPO.
 """
 
 from collections import defaultdict
@@ -33,26 +30,25 @@ import torch
 from verl.trainer.ppo.core_algos import register_adv_est
 
 
-def _group_normalize(scores: torch.Tensor, index: np.ndarray, eps: float = 1e-6) -> torch.Tensor:
-    """Group-normalize scalar scores by index (GRPO-style)."""
+def _group_normalize_scores(scores: torch.Tensor, index: np.ndarray, eps: float = 1e-6):
+    """Returns (mean_per_sample, std_per_sample), each [B]."""
     bsz = scores.shape[0]
     by_idx: dict = defaultdict(list)
     for i in range(bsz):
         by_idx[index[i]].append(scores[i])
-    mean: dict = {}
-    std: dict = {}
+    g_mean: dict = {}
+    g_std: dict = {}
     for k, vs in by_idx.items():
         if len(vs) == 1:
-            mean[k] = torch.tensor(0.0, device=scores.device)
-            std[k] = torch.tensor(1.0, device=scores.device)
+            g_mean[k] = torch.tensor(0.0, device=scores.device)
+            g_std[k] = torch.tensor(1.0, device=scores.device)
         else:
             t = torch.stack(vs)
-            mean[k] = t.mean()
-            std[k] = t.std()
-    out = scores.clone()
-    for i in range(bsz):
-        out[i] = (scores[i] - mean[index[i]]) / (std[index[i]] + eps)
-    return out
+            g_mean[k] = t.mean()
+            g_std[k] = t.std()
+    mean_per_sample = torch.stack([g_mean[index[i]] for i in range(bsz)])
+    std_per_sample = torch.stack([g_std[index[i]] for i in range(bsz)])
+    return mean_per_sample, std_per_sample + eps
 
 
 @register_adv_est("spo")
@@ -73,9 +69,9 @@ def compute_spo_outcome_advantage(
     """
     prob_mask_threshold = 0.9
     if config is not None:
-        prob_mask_threshold = float(
-            getattr(config, "spo_prob_mask_threshold", prob_mask_threshold) or prob_mask_threshold
-        )
+        v = getattr(config, "spo_prob_mask_threshold", None)
+        if v is not None:
+            prob_mask_threshold = float(v)
 
     bsz, resp_max_len = token_level_rewards.shape
     advantages = torch.zeros_like(token_level_rewards)
@@ -84,54 +80,49 @@ def compute_spo_outcome_advantage(
 
     if have_mc:
         # Paper-faithful SPO-chain.
-        # spo_segment_values[i, :] = [V(s_0), V(s_cp1), ..., V(s_cpT), R_i]
-        # spo_segment_cutpoints[i, :] = [0, cp1, ..., cpT, resp_len]
-        # All indexing in token coordinates within the response (0..resp_max_len-1).
+        # spo_segment_values[i] = [V(s_0), V(s_cp1), ..., V(s_cpT), R_i]
+        # spo_segment_cutpoints[i] = [0, cp1, ..., cpT, resp_len]
+        V = spo_segment_values.float()
+        cps = spo_segment_cutpoints
 
-        # Optional: group-normalize the segment values across the prompt group so the
-        # scale matches GRPO. We normalize the final R column (since V(s_0) is the
-        # group baseline; normalizing it would zero it out) and then form differences.
+        # Center each row by V(s_0). After this, V_c[:,0]=0 and V_c[:,-1] = R - V(s_0).
+        V_c = V - V[:, :1]
+
+        # Group-normalize by R's std for variance reduction (GRPO-comparable scale).
         if index is not None:
-            r_col = spo_segment_values[:, -1]
-            r_norm = _group_normalize(r_col, index)
-            scale = (r_norm.abs().mean() + 1e-6) / (r_col.abs().mean() + 1e-6)
-            seg_vals = spo_segment_values.clone()
-            # Center each row by V(s_0) and scale so the final value matches normalized R.
-            seg_vals = seg_vals - seg_vals[:, :1]
-            # Scale uniformly within a row so seg_vals[:, -1] equals r_norm - 0 = r_norm.
-            denom = seg_vals[:, -1].abs() + 1e-6
-            row_scale = (r_norm.abs() + 1e-6) / denom
-            row_sign = torch.sign(r_norm) * torch.sign(seg_vals[:, -1] + 1e-12)
-            row_scale = row_scale * row_sign
-            seg_vals = seg_vals * row_scale.unsqueeze(-1)
+            R = V[:, -1]
+            _, std_per_sample = _group_normalize_scores(R, index)
+            V_norm = V_c / std_per_sample.unsqueeze(-1)
         else:
-            seg_vals = spo_segment_values - spo_segment_values[:, :1]
+            V_norm = V_c
 
+        # Segment advantages: A_t = V_norm(s_{cp_t}) - V_norm(s_{cp_{t-1}}) for segment t in [0..T]
+        # We broadcast A_t over tokens [cps[t], cps[t+1]).
         for i in range(bsz):
-            cps = spo_segment_cutpoints[i].tolist()
-            vs = seg_vals[i].tolist()
-            for j in range(len(cps) - 1):
-                start = int(cps[j])
-                end = int(cps[j + 1])
+            cp_row = cps[i].tolist()
+            vn_row = V_norm[i].tolist()
+            for j in range(len(cp_row) - 1):
+                start = int(cp_row[j])
+                end = int(cp_row[j + 1])
                 if end <= start:
                     continue
                 end = min(end, resp_max_len)
                 if start >= resp_max_len:
                     break
-                seg_adv = vs[j + 1] - vs[j]
-                advantages[i, start:end] = seg_adv
+                advantages[i, start:end] = vn_row[j + 1] - vn_row[j]
 
-        # Probability masking: zero tokens where old policy was already confident.
+        # Probability masking (paper Eq. 3).
         if old_log_probs is not None:
             probs = torch.exp(old_log_probs)
             mask = (probs > prob_mask_threshold) & response_mask.bool()
             advantages = advantages.masked_fill(mask, 0.0)
     else:
-        # GRPO-style fallback.
+        # GRPO-style fallback (MC values absent).
         scores = token_level_rewards.sum(dim=-1)
         if index is None:
             index = np.arange(bsz)
-        norm_scores = _group_normalize(scores, index)
+        mean_ps, std_ps = _group_normalize_scores(scores, index)
+        norm_scores = (scores - mean_ps) / std_ps
         for i in range(bsz):
             resp_len = int(response_mask[i].sum().item())
             if resp_len == 0:
